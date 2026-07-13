@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matchmaking Demo</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
+  h1 { font-size: 1.3rem; }
+  section { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  input { padding: .5rem; margin: .2rem 0; width: 100%; box-sizing: border-box; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; }
+  button { padding: .5rem 1rem; margin: .3rem .3rem .3rem 0; cursor: pointer; background: #2d6cdf; color: #fff; border: 0; border-radius: 4px; }
+  button:disabled { background: #444; cursor: default; }
+  .move-btn { font-size: 1.5rem; padding: .6rem 1.2rem; }
+  #log { font-size: .8rem; color: #8a8; white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
+  .hidden { display: none; }
+  .status { color: #f5c542; }
+</style>
+</head>
+<body>
+<h1>⚔️ Matchmaking & Lobby Demo</h1>
+
+<section id="auth-section">
+  <h3>Login / Register</h3>
+  <input id="username" placeholder="username">
+  <input id="email" placeholder="email (register only)">
+  <input id="password" type="password" placeholder="password (min 8 chars)">
+  <button onclick="register()">Register</button>
+  <button onclick="login()">Login</button>
+</section>
+
+<section id="profile-section" class="hidden">
+  <h3 id="profile-name"></h3>
+  <div>MMR: <b id="profile-mmr"></b> · Games: <span id="profile-games"></span></div>
+</section>
+
+<section id="queue-section" class="hidden">
+  <h3>Matchmaking</h3>
+  <button id="btn-join" onclick="joinQueue()">Find Match</button>
+  <button id="btn-leave" onclick="leaveQueue()" class="hidden">Leave Queue</button>
+  <div id="queue-status" class="status"></div>
+</section>
+
+<section id="lobby-section" class="hidden">
+  <h3>Match: <span id="lobby-vs"></span></h3>
+  <div>Score: <b id="score"></b> · Round <span id="round">1</span></div>
+  <div id="match-status" class="status"></div>
+  <div id="moves" class="hidden">
+    <button class="move-btn" onclick="makeMove('rock')">🪨</button>
+    <button class="move-btn" onclick="makeMove('paper')">📄</button>
+    <button class="move-btn" onclick="makeMove('scissors')">✂️</button>
+  </div>
+</section>
+
+<section><div id="log"></div></section>
+
+<script>
+let accessToken = null, refreshToken = null, me = null, conn = null;
+let currentLobby = null, statusTimer = null, iAmA = false;
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent = `[${new Date().toLocaleTimeString()}] ${m}\n` + $('log').textContent; };
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(accessToken ? { Authorization: 'Bearer ' + accessToken } : {}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function register() {
+  try {
+    const data = await api('POST', '/auth/register', {
+      username: $('username').value, email: $('email').value, password: $('password').value });
+    await onAuthed(data);
+  } catch (e) { log('Register failed: ' + e.message); }
+}
+
+async function login() {
+  try {
+    const data = await api('POST', '/auth/login', {
+      username: $('username').value, password: $('password').value });
+    await onAuthed(data);
+  } catch (e) { log('Login failed: ' + e.message); }
+}
+
+async function onAuthed(data) {
+  accessToken = data.accessToken; refreshToken = data.refreshToken; me = data.username;
+  $('auth-section').classList.add('hidden');
+  $('profile-section').classList.remove('hidden');
+  $('queue-section').classList.remove('hidden');
+  await refreshProfile();
+  await connectHub();
+  log(`Logged in as ${me}`);
+  // Reconnect: aktif lobi varsa geri dön
+  try {
+    const mine = await api('GET', '/lobbies/mine');
+    if (mine && mine.lobbyId) { log('Active lobby found, rejoining...'); enterLobby(mine.lobbyId, '?', '?'); }
+  } catch {}
+}
+
+async function refreshProfile() {
+  const p = await api('GET', '/players/me');
+  $('profile-name').textContent = p.username;
+  $('profile-mmr').textContent = p.mmr;
+  $('profile-games').textContent = p.gamesPlayed;
+}
+
+async function connectHub() {
+  conn = new signalR.HubConnectionBuilder()
+    .withUrl('/hubs/game', { accessTokenFactory: () => accessToken })
+    .withAutomaticReconnect()
+    .build();
+
+  conn.on('MatchFound', d => {
+    log(`Match found vs ${d.opponent} (${d.opponentMmr} MMR)`);
+    stopStatusPolling();
+    enterLobby(d.lobbyId, d.opponent, d.opponentMmr);
+  });
+  conn.on('WaitingForOpponent', () => $('match-status').textContent = 'Waiting for opponent...');
+  conn.on('OpponentReady', () => log('Opponent is ready'));
+  conn.on('MatchStarted', d => {
+    iAmA = d.playerA === me;
+    $('lobby-vs').textContent = `${d.playerA} vs ${d.playerB}`;
+    $('score').textContent = `${d.scoreA} - ${d.scoreB}`;
+    $('round').textContent = d.round;
+    $('match-status').textContent = 'Make your move!';
+    $('moves').classList.remove('hidden');
+    log('Match started');
+  });
+  conn.on('MoveAccepted', () => { $('match-status').textContent = 'Waiting for opponent move...'; setMoveButtons(false); });
+  conn.on('OpponentMoved', () => log('Opponent has moved'));
+  conn.on('RoundResult', d => {
+    $('score').textContent = `${d.scoreA} - ${d.scoreB}`;
+    $('round').textContent = d.round;
+    const oc = d.outcome === 'Draw' ? 'Draw — replay round'
+      : (d.outcome === 'PlayerA') === iAmA ? 'You won the round!' : 'You lost the round.';
+    log(`Round ${d.round}: ${d.moveA} vs ${d.moveB} → ${oc}`);
+    $('match-status').textContent = oc + ' Next move!';
+    setMoveButtons(true);
+  });
+  conn.on('MatchEnded', async d => {
+    const won = d.winner === me;
+    const delta = iAmA ? d.deltaA : d.deltaB;
+    log(`Match over. Winner: ${d.winner} (${d.scoreA}-${d.scoreB}). MMR ${delta >= 0 ? '+' : ''}${delta}`);
+    $('match-status').textContent = won ? `🏆 You won! MMR +${delta}` : `Defeat. MMR ${delta}`;
+    $('moves').classList.add('hidden');
+    currentLobby = null;
+    await refreshProfile();
+    setTimeout(() => { $('lobby-section').classList.add('hidden'); }, 4000);
+  });
+  conn.on('Error', m => log('Server: ' + m));
+
+  await conn.start();
+}
+
+function enterLobby(lobbyId, opponent, mmr) {
+  currentLobby = lobbyId;
+  $('lobby-section').classList.remove('hidden');
+  $('lobby-vs').textContent = `${me} vs ${opponent}`;
+  $('match-status').textContent = 'Joining lobby...';
+  setMoveButtons(true);
+  conn.invoke('JoinLobby', lobbyId).catch(e => log('JoinLobby failed: ' + e));
+}
+
+function setMoveButtons(enabled) {
+  document.querySelectorAll('.move-btn').forEach(b => b.disabled = !enabled);
+}
+
+async function makeMove(move) {
+  if (!currentLobby) return;
+  conn.invoke('MakeMove', currentLobby, move).catch(e => log('MakeMove failed: ' + e));
+}
+
+async function joinQueue() {
+  try {
+    await api('POST', '/queue/join');
+    log('Joined queue');
+    $('btn-join').classList.add('hidden');
+    $('btn-leave').classList.remove('hidden');
+    statusTimer = setInterval(async () => {
+      try {
+        const s = await api('GET', '/queue/status');
+        if (s.inQueue) $('queue-status').textContent =
+          `In queue ${s.waitSeconds}s · window ±${s.currentWindow} MMR · ${s.queueLength} in queue`;
+      } catch {}
+    }, 1000);
+  } catch (e) { log('Join failed: ' + e.message); }
+}
+
+async function leaveQueue() {
+  try { await api('DELETE', '/queue/leave'); log('Left queue'); } catch (e) { log(e.message); }
+  stopStatusPolling();
+}
+
+function stopStatusPolling() {
+  clearInterval(statusTimer);
+  $('queue-status').textContent = '';
+  $('btn-join').classList.remove('hidden');
+  $('btn-leave').classList.add('hidden');
+}
+</script>
+</body>
+</html>
