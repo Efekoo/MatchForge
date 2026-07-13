@@ -20,6 +20,8 @@ public class LobbyState
     public bool ReadyB { get; set; }
     public string State { get; set; } = "WaitingReady"; // WaitingReady | InProgress | Finished
     public long StartedAtMs { get; init; }
+    public long DiscA { get; set; } // 0 = bağlı; >0 = kopma anı (unix ms)
+    public long DiscB { get; set; }
 
     public bool Contains(Guid playerId) => playerId == PlayerA || playerId == PlayerB;
 }
@@ -30,6 +32,7 @@ public class LobbyState
 public class LobbyStore(IConnectionMultiplexer redis)
 {
     public static readonly TimeSpan LobbyTtl = TimeSpan.FromMinutes(10);
+    public const string ActiveSetKey = "lobbies:active";
     private static string LobbyKey(string lobbyId) => $"lobby:{lobbyId}";
     private static string PlayerLobbyKey(Guid playerId) => $"player:lobby:{playerId}";
 
@@ -49,7 +52,8 @@ public class LobbyStore(IConnectionMultiplexer redis)
             new("moveA", ""), new("moveB", ""),
             new("readyA", 0), new("readyB", 0),
             new("state", "WaitingReady"),
-            new("startedAtMs", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+            new("startedAtMs", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+            new("discA", 0), new("discB", 0)
         };
 
         var db = Db;
@@ -57,6 +61,7 @@ public class LobbyStore(IConnectionMultiplexer redis)
         await db.KeyExpireAsync(LobbyKey(lobbyId), LobbyTtl);
         await db.StringSetAsync(PlayerLobbyKey(playerA), lobbyId, LobbyTtl);
         await db.StringSetAsync(PlayerLobbyKey(playerB), lobbyId, LobbyTtl);
+        await db.SetAddAsync(ActiveSetKey, lobbyId);
         return lobbyId;
     }
 
@@ -83,9 +88,20 @@ public class LobbyStore(IConnectionMultiplexer redis)
             ReadyA = (int)map["readyA"] == 1,
             ReadyB = (int)map["readyB"] == 1,
             State = map["state"]!,
-            StartedAtMs = (long)map["startedAtMs"]
+            StartedAtMs = (long)map["startedAtMs"],
+            DiscA = map.TryGetValue("discA", out var da) ? (long)da : 0,
+            DiscB = map.TryGetValue("discB", out var db) ? (long)db : 0
         };
     }
+
+    public async Task<string[]> GetActiveLobbyIdsAsync()
+    {
+        var members = await Db.SetMembersAsync(ActiveSetKey);
+        return members.Select(m => (string)m!).ToArray();
+    }
+
+    public Task RemoveFromActiveAsync(string lobbyId) =>
+        Db.SetRemoveAsync(ActiveSetKey, lobbyId);
 
     public async Task<string?> GetPlayerLobbyIdAsync(Guid playerId)
     {
@@ -99,9 +115,11 @@ public class LobbyStore(IConnectionMultiplexer redis)
 
     public async Task DeleteAsync(string lobbyId, Guid playerA, Guid playerB)
     {
-        await Db.KeyDeleteAsync(new RedisKey[]
+        var db = Db;
+        await db.KeyDeleteAsync(new RedisKey[]
         {
             LobbyKey(lobbyId), PlayerLobbyKey(playerA), PlayerLobbyKey(playerB)
         });
+        await db.SetRemoveAsync(ActiveSetKey, lobbyId);
     }
 }

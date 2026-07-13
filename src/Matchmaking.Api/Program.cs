@@ -1,6 +1,7 @@
 using System.IdentityModel.Tokens.Jwt;
 using Matchmaking.Api.Auth;
 using Matchmaking.Api.Data;
+using Matchmaking.Api.Infrastructure;
 using Matchmaking.Api.Lobby;
 using Matchmaking.Api.Queue;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -27,10 +28,14 @@ builder.Services.AddSingleton<JwtService>();
 builder.Services.AddSingleton<QueueService>();
 builder.Services.AddSingleton<LobbyStore>();
 builder.Services.AddSingleton<MatchFinalizer>();
+builder.Services.AddSingleton<RedisLockService>();
 builder.Services.AddHostedService<MatchmakerService>();
+builder.Services.AddHostedService<LobbyReaperService>();
 
 builder.Services.AddControllers();
-builder.Services.AddSignalR();
+
+// Redis backplane: aynı lobideki iki oyuncu farklı replikalara bağlıysa mesajlar yine akar
+builder.Services.AddSignalR().AddStackExchangeRedis(redisConn);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -61,22 +66,35 @@ builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
-// --- Şema oluşturma (MVP: EnsureCreated; v1.1'de EF migrations'a geçilecek) ---
+// --- Şema oluşturma ---
+// İki replika aynı anda EnsureCreated çağırırsa tablolar çakışabilir: Redis kilidi ile serileştir.
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var retries = 10;
-    while (true)
+    var locks = app.Services.GetRequiredService<RedisLockService>();
+
+    var initToken = await locks.AcquireAsync("db:init:lock",
+        ttl: TimeSpan.FromSeconds(60), maxWait: TimeSpan.FromSeconds(90));
+    try
     {
-        try
+        var retries = 10;
+        while (true)
         {
-            db.Database.EnsureCreated();
-            break;
+            try
+            {
+                db.Database.EnsureCreated();
+                break;
+            }
+            catch when (retries-- > 0)
+            {
+                await Task.Delay(2000);
+            }
         }
-        catch when (retries-- > 0)
-        {
-            await Task.Delay(2000);
-        }
+    }
+    finally
+    {
+        if (initToken is not null)
+            await locks.ReleaseAsync("db:init:lock", initToken);
     }
 }
 

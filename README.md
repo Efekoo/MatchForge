@@ -27,22 +27,25 @@ The loop closes end-to-end: match results are written to PostgreSQL and ratings 
 ## Architecture
 
 ```
-Browser (SignalR client)
+Browser (SignalR client, WebSocket-only)
         │
-ASP.NET Core API ── SignalR hub (/hubs/game)
-        │                  │
-   PostgreSQL            Redis
-   (players, matches,   (queue sorted set, lobby state
-    MMR history,         with TTL, join timestamps)
+      nginx (round-robin load balancer)
+        │
+ASP.NET Core API ×2 replicas ── SignalR hub (/hubs/game)
+        │                            │
+   PostgreSQL                      Redis
+   (players, matches,   (queue sorted set, lobby state with TTL,
+    MMR history,         SignalR backplane, distributed locks)
     refresh tokens)
         │
-Matchmaker BackgroundService (scans queue every 2s)
+Matchmaker + LobbyReaper BackgroundServices
+(run on every replica, serialized via Redis locks)
 ```
 
 - **PostgreSQL** — everything that must survive: players, match history, MMR change log, refresh tokens.
-- **Redis** — everything fast and ephemeral: matchmaking queue (sorted set keyed by MMR), lobby state (hash with TTL, so abandoned lobbies clean themselves up).
-- **SignalR** — real-time events: `MatchFound`, `MatchStarted`, `RoundResult`, `MatchEnded`.
-- **BackgroundService** — matchmaking runs isolated from API requests on a 2-second tick.
+- **Redis** — everything fast and ephemeral: matchmaking queue (sorted set keyed by MMR), lobby state (hash with TTL, so abandoned lobbies clean themselves up), distributed locks, SignalR backplane.
+- **SignalR** — real-time events: `MatchFound`, `MatchStarted`, `RoundResult`, `MatchEnded`, `OpponentDisconnected`, `OpponentReconnected`, `MatchCancelled`. The **Redis backplane** ensures messages flow even when two players in the same lobby are connected to different replicas.
+- **BackgroundServices** — matchmaking (2 s tick) and lobby reaping (5 s tick) run on every replica but are serialized with Redis locks, so scaling out doesn't break correctness.
 
 ## Matchmaking: Expanding MMR Window
 
@@ -81,15 +84,24 @@ WS     /hubs/game            (SignalR)
 
 Auth uses **access + refresh tokens** with rotation; only SHA-256 hashes of refresh tokens are stored. Passwords hashed with bcrypt. SignalR connections authenticate via JWT (`access_token` query param, as WebSockets can't carry headers).
 
-## Concurrency & Resilience (current state)
+## Concurrency & Resilience
 
-- **Idempotent queue join** — `ZADD NX`: a second join request (e.g. from a second device) is rejected.
-- **Queue-leave race** — the matchmaker re-checks removal results; if a player left between scan and pairing, the other player is re-queued instead of being stranded.
-- **Per-lobby serialization** — hub method invocations for the same lobby are serialized (in-process lock in MVP; will move to Redis distributed locks in v1.1 for multi-replica).
+**Race conditions:**
+
+- **Can the same player be assigned to two matches?** No. Every pairing acquires a per-player distributed lock (`mm:lock:{playerId}`, `SETNX` + TTL); a matchmaking attempt that can't get the lock skips that player. Lock release is a compare-and-delete Lua script, so an expired lock taken over by someone else is never deleted by mistake.
+- **What if two replicas run the matchmaker simultaneously?** The matchmaking round itself is serialized with `mm:matchmaker:lock` — every replica runs the service, but only one executes a round at a time. Horizontal scaling stays intact.
+- **Queueing from two devices at once?** Queue join is idempotent (`ZADD NX`); the second request is rejected.
+- **Player leaves between scan and pairing?** The matchmaker checks removal results; the stranded player is re-queued.
+- **Concurrent moves in the same lobby?** Hub invocations for a lobby are serialized with a Redis lock (`lock:lobby:{id}`) — replica-independent. The reaper takes the same lock before closing a lobby, so a match can't be forfeited mid-move.
 - **Server-side move validation** — the client is never trusted; moves and turn order are validated in the hub.
-- **Self-cleaning state** — lobby keys carry a 10-minute TTL; abandoned lobbies disappear on their own.
 
-Planned for v1.1: Redis `SETNX` distributed locks, disconnect/reconnect grace periods, 2 API replicas behind nginx with a SignalR Redis backplane, k6 load-test numbers.
+**Disconnect / reconnect** (connection id is ephemeral, player identity comes from the JWT):
+
+- **In queue:** a disconnect sets a grace marker; if the player isn't back within **15 s**, the matchmaker sweep drops them from the queue. Reconnecting in time clears the marker — no requeue needed.
+- **In match:** the lobby stays open for **30 s**. The opponent sees `OpponentDisconnected`; on return (new connection id, same JWT identity) the player rejoins via `JoinLobby`, receives the current match state, and the opponent sees `OpponentReconnected`. If the grace period expires, the `LobbyReaper` awards a **win by forfeit** to the connected player — with full Elo/MMR consequences.
+- **Self-cleaning state** — lobby keys carry a 10-minute TTL as a last-resort backstop.
+
+Planned for v1.1 completion: k6 load-test numbers, GitHub Actions + Testcontainers integration tests.
 
 ## Tests
 
@@ -103,19 +115,21 @@ Unit tests cover the Elo calculator (K-factor behavior, underdog gains, zero-sum
 
 ```
 src/Matchmaking.Api/
-  Domain/     Elo, match window, RPS rules, entities (pure, unit-testable)
-  Data/       EF Core DbContext (PostgreSQL)
-  Auth/       JWT service, auth controller (access + refresh flow)
-  Players/    profile & MMR history endpoints
-  Queue/      Redis queue service, controller, matchmaker BackgroundService
-  Lobby/      Redis lobby store, SignalR GameHub, match finalizer
-  wwwroot/    minimal demo client
+  Domain/         Elo, match window, RPS rules, entities (pure, unit-testable)
+  Data/           EF Core DbContext (PostgreSQL)
+  Infrastructure/ Redis distributed lock service (SETNX + Lua release)
+  Auth/           JWT service, auth controller (access + refresh flow)
+  Players/        profile & MMR history endpoints
+  Queue/          Redis queue service, controller, matchmaker BackgroundService
+  Lobby/          Redis lobby store, SignalR GameHub, match finalizer, lobby reaper
+  wwwroot/        minimal demo client
 tests/Matchmaking.Tests/
+nginx.conf        WebSocket-aware reverse proxy for the 2 API replicas
 ```
 
 ## Roadmap
 
-- **v1.1** — Redis distributed locks, reconnect flow, 2 replicas + nginx + SignalR backplane, k6 load tests, GitHub Actions + Testcontainers.
+- **v1.1** — ~~Redis distributed locks~~, ~~reconnect flow~~, ~~2 replicas + nginx + SignalR backplane~~ (done) · k6 load tests, GitHub Actions + Testcontainers (remaining).
 - **v2** — 2v2 party queue with team balancing, OpenTelemetry + Prometheus + Grafana, seasonal leaderboard, MMR decay.
 
 See [PLAN.md](PLAN.md) for the full design document.

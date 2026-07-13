@@ -113,10 +113,23 @@ async function refreshProfile() {
 }
 
 async function connectHub() {
+  // skipNegotiation + WebSockets: nginx round-robin arkasında sticky session gerekmez
   conn = new signalR.HubConnectionBuilder()
-    .withUrl('/hubs/game', { accessTokenFactory: () => accessToken })
+    .withUrl('/hubs/game', {
+      accessTokenFactory: () => accessToken,
+      skipNegotiation: true,
+      transport: signalR.HttpTransportType.WebSockets
+    })
     .withAutomaticReconnect()
     .build();
+
+  conn.onreconnected(async () => {
+    log('Reconnected to server');
+    try {
+      const mine = await api('GET', '/lobbies/mine');
+      if (mine && mine.lobbyId) conn.invoke('JoinLobby', mine.lobbyId).catch(() => {});
+    } catch {}
+  });
 
   conn.on('MatchFound', d => {
     log(`Match found vs ${d.opponent} (${d.opponentMmr} MMR)`);
@@ -148,12 +161,27 @@ async function connectHub() {
   conn.on('MatchEnded', async d => {
     const won = d.winner === me;
     const delta = iAmA ? d.deltaA : d.deltaB;
-    log(`Match over. Winner: ${d.winner} (${d.scoreA}-${d.scoreB}). MMR ${delta >= 0 ? '+' : ''}${delta}`);
+    const via = d.forfeit ? ' (by forfeit)' : '';
+    log(`Match over${via}. Winner: ${d.winner} (${d.scoreA}-${d.scoreB}). MMR ${delta >= 0 ? '+' : ''}${delta}`);
     $('match-status').textContent = won ? `🏆 You won! MMR +${delta}` : `Defeat. MMR ${delta}`;
     $('moves').classList.add('hidden');
     currentLobby = null;
     await refreshProfile();
     setTimeout(() => { $('lobby-section').classList.add('hidden'); }, 4000);
+  });
+  conn.on('OpponentDisconnected', d => {
+    log(`Opponent disconnected — forfeit in ${d.graceSeconds}s if they don't return`);
+    $('match-status').textContent = `Opponent disconnected (waiting ${d.graceSeconds}s)...`;
+  });
+  conn.on('OpponentReconnected', () => {
+    log('Opponent reconnected');
+    $('match-status').textContent = 'Opponent is back. Continue!';
+  });
+  conn.on('MatchCancelled', d => {
+    log('Match cancelled: ' + (d.reason || ''));
+    currentLobby = null;
+    $('moves').classList.add('hidden');
+    $('lobby-section').classList.add('hidden');
   });
   conn.on('Error', m => log('Server: ' + m));
 
