@@ -120,6 +120,34 @@ dotnet test   # requires Docker (integration tests use Testcontainers)
 
 CI (GitHub Actions) runs build + all tests + Docker image build on every push.
 
+## Load Testing (k6)
+
+```bash
+docker compose up -d --build
+k6 run loadtest/matchmaking.js              # 1000 players (default)
+k6 run -e PLAYERS=500 loadtest/matchmaking.js
+```
+
+Each virtual user registers, joins the queue, and polls until the matchmaker pairs them. The key metric is `match_time` — time from queue join to lobby creation.
+
+**Results** — 2 API replicas behind nginx, local Docker Desktop (WSL2):
+
+| Metric | Value |
+|---|---|
+| Concurrent players | **1,000** (ramped over ~60 s) |
+| Matched players | **1,000 / 1,000** (0 unmatched) |
+| Failed requests | **0.00%** (4,056 requests) |
+| match_time p95 | **2.0 s** |
+| match_time avg / med | 1.03 s / 1.0 s |
+| match_time max | 3.51 s |
+| queue/join p95 | 3.5 ms |
+| lobbies/mine p95 | 1.5 ms |
+| auth/register p95 | 281 ms (bcrypt — intentionally expensive) |
+
+With every player starting at 1000 MMR, pairs fit the initial ±50 window immediately, so match time is dominated by the matchmaker's 2-second scan tick — exactly what the design predicts.
+
+> Reset state after a run: `docker compose down -v`
+
 ## Project Layout
 
 ```
@@ -138,7 +166,7 @@ nginx.conf        WebSocket-aware reverse proxy for the 2 API replicas
 
 ## Roadmap
 
-- **v1.1** — ~~Redis distributed locks~~, ~~reconnect flow~~, ~~2 replicas + nginx + SignalR backplane~~, ~~GitHub Actions + Testcontainers~~ (done) · k6 load tests (remaining).
+- **v1.1** — ✅ complete: Redis distributed locks, reconnect flow, 2 replicas + nginx + SignalR backplane, GitHub Actions + Testcontainers, k6 load tests.
 - **v2** — 2v2 party queue with team balancing, OpenTelemetry + Prometheus + Grafana, seasonal leaderboard, MMR decay.
 
 See [PLAN.md](PLAN.md) for the full design document.
