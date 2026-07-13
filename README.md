@@ -1,5 +1,7 @@
 # Real-Time Matchmaking & Lobby Service
 
+[![CI](https://github.com/Efekoo/MatchForge/actions/workflows/ci.yml/badge.svg)](https://github.com/Efekoo/MatchForge/actions/workflows/ci.yml)
+
 A standalone, scalable backend service solving the three core problems behind competitive online games: **authentication**, **skill-based matchmaking**, and **real-time session management**. No game engine required — the mini-game (rock-paper-scissors, best of 3) is intentionally trivial because the point is the infrastructure, not the game logic.
 
 **Stack:** C# / ASP.NET Core 8 · PostgreSQL · Redis · SignalR · JWT · Docker Compose
@@ -106,10 +108,17 @@ Planned for v1.1 completion: k6 load-test numbers, GitHub Actions + Testcontaine
 ## Tests
 
 ```bash
-dotnet test
+dotnet test   # requires Docker (integration tests use Testcontainers)
 ```
 
-Unit tests cover the Elo calculator (K-factor behavior, underdog gains, zero-sum property), the expanding match window, and rock-paper-scissors resolution.
+- **Unit tests** — Elo calculator (K-factor behavior, underdog gains, zero-sum property), expanding match window, rock-paper-scissors resolution. Pure domain logic, no dependencies.
+- **Integration tests (Testcontainers)** — real PostgreSQL and Redis containers, no mocks:
+  - Full end-to-end flow: two SignalR clients queue up, get matched by the real `MatchmakerService`, play a best-of-3 match, and both players' MMR (+20/−20) and match history are asserted from the database.
+  - Race condition: 10 parallel queue-join requests from the same player → exactly 1 accepted, 9 rejected (`ZADD NX` atomicity).
+  - Refresh token rotation: a used refresh token is rejected on reuse.
+  - Server-side move validation: invalid moves and double moves are rejected.
+
+CI (GitHub Actions) runs build + all tests + Docker image build on every push.
 
 ## Project Layout
 
@@ -129,7 +138,7 @@ nginx.conf        WebSocket-aware reverse proxy for the 2 API replicas
 
 ## Roadmap
 
-- **v1.1** — ~~Redis distributed locks~~, ~~reconnect flow~~, ~~2 replicas + nginx + SignalR backplane~~ (done) · k6 load tests, GitHub Actions + Testcontainers (remaining).
+- **v1.1** — ~~Redis distributed locks~~, ~~reconnect flow~~, ~~2 replicas + nginx + SignalR backplane~~, ~~GitHub Actions + Testcontainers~~ (done) · k6 load tests (remaining).
 - **v2** — 2v2 party queue with team balancing, OpenTelemetry + Prometheus + Grafana, seasonal leaderboard, MMR decay.
 
 See [PLAN.md](PLAN.md) for the full design document.

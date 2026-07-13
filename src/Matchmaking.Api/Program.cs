@@ -112,3 +112,6 @@ app.MapHub<GameHub>("/hubs/game");
 app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
 
 app.Run();
+
+// Integration testlerin WebApplicationFactory<Program> ile erişebilmesi için
+public partial class Program { }

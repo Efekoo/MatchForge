@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore -c Release
+
+      # Integration testler Testcontainers ile gerçek Postgres/Redis ayağa kaldırır;
+      # GitHub runner'larında Docker hazır geldiği için ekstra servis tanımı gerekmez.
+      - name: Test
+        run: dotnet test --no-build -c Release --verbosity normal
+
+  docker-image:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f src/Matchmaking.Api/Dockerfile -t matchforge-api .
