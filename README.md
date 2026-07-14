@@ -6,6 +6,8 @@ A standalone, scalable backend service solving the three core problems behind co
 
 **Stack:** C# / ASP.NET Core 8 · PostgreSQL · Redis · SignalR · JWT · Docker Compose
 
+![Demo: two players queue up, get matched, and play a best-of-3 with live MMR updates](docs/demo.gif)
+
 ## Quick Start
 
 ```bash

@@ -70,7 +70,12 @@ async function api(method, path, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const detail = data.error
+      || (data.errors ? JSON.stringify(data.errors) : '')
+      || res.statusText || 'unknown error';
+    throw new Error(`HTTP ${res.status}: ${detail}`);
+  }
   return data;
 }
 
@@ -96,7 +101,12 @@ async function onAuthed(data) {
   $('profile-section').classList.remove('hidden');
   $('queue-section').classList.remove('hidden');
   await refreshProfile();
-  await connectHub();
+  try {
+    await connectHub();
+  } catch (e) {
+    log('Hub connection failed: ' + (e.message || e));
+    return;
+  }
   log(`Logged in as ${me}`);
   // Reconnect: aktif lobi varsa geri dön
   try {
