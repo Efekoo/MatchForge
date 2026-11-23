@@ -4,7 +4,7 @@
 
 A standalone, scalable backend service solving the three core problems behind competitive online games: **authentication**, **skill-based matchmaking**, and **real-time session management**. No game engine required — the mini-game (rock-paper-scissors, best of 3) is intentionally trivial because the point is the infrastructure, not the game logic.
 
-**Stack:** C# / ASP.NET Core 8 · PostgreSQL · Redis · SignalR · JWT · Docker Compose
+**Stack:** C# / ASP.NET Core 8 · PostgreSQL · Redis · SignalR · RabbitMQ (MassTransit) · JWT · Docker Compose
 
 ![Demo: two players queue up, get matched, and play a best-of-3 with live MMR updates](docs/demo.gif)
 
@@ -17,6 +17,8 @@ docker compose up --build
 Then open **http://localhost:8080** in two different browsers (or one normal + one incognito window), register two players, and hit *Find Match* in both.
 
 Swagger UI: http://localhost:8080/swagger · Health: http://localhost:8080/health
+
+Leaderboard (Stats service): http://localhost:8081/leaderboard · RabbitMQ management UI: http://localhost:15672 (guest / guest)
 
 ## The Loop
 
@@ -44,12 +46,33 @@ ASP.NET Core API ×2 replicas ── SignalR hub (/hubs/game)
         │
 Matchmaker + LobbyReaper BackgroundServices
 (run on every replica, serialized via Redis locks)
+        │
+  transactional outbox (PostgreSQL) ──► RabbitMQ ──► Stats service
+  MatchCreated, MatchCompleted                       (own database:
+                                                      leaderboard, streaks,
+                                                      daily activity)
 ```
 
 - **PostgreSQL** — everything that must survive: players, match history, MMR change log, refresh tokens.
 - **Redis** — everything fast and ephemeral: matchmaking queue (sorted set keyed by MMR), lobby state (hash with TTL, so abandoned lobbies clean themselves up), distributed locks, SignalR backplane.
 - **SignalR** — real-time events: `MatchFound`, `MatchStarted`, `RoundResult`, `MatchEnded`, `OpponentDisconnected`, `OpponentReconnected`, `MatchCancelled`. The **Redis backplane** ensures messages flow even when two players in the same lobby are connected to different replicas.
 - **BackgroundServices** — matchmaking (2 s tick) and lobby reaping (5 s tick) run on every replica but are serialized with Redis locks, so scaling out doesn't break correctness.
+- **RabbitMQ** — domain events (`MatchCreated`, `MatchCompleted`) for other services. The API publishes; the Stats service consumes. The two services share no tables, only the message contracts in `Matchmaking.Contracts`.
+
+## Event-Driven Stats Service
+
+Match results feed a separate **Stats service** over RabbitMQ (MassTransit), so features like leaderboards and streaks never slow down or break the match flow.
+
+- **Transactional outbox (API side)** — `MatchCompleted` is written to an outbox table in the **same PostgreSQL transaction** as the match result, Elo update and MMR history. A background delivery service forwards it to RabbitMQ. No "result saved but event lost" or "event sent but transaction rolled back" states, even if the broker is down for a while.
+- **Idempotent consumer (Stats side)** — delivery is at-least-once, so the same message can arrive twice. An **inbox** table records processed message ids in the same transaction as the stats update; a redelivered message is skipped. Covered by an integration test that publishes the same message twice.
+- **Retries + dead-lettering** — transient failures are retried with exponential backoff (5 attempts); messages that still fail move to `<queue>_error` for inspection instead of blocking the queue.
+- **Ordering** — streaks depend on event order, so each Stats queue is consumed sequentially (concurrency 1, prefetch 1). As a second guard, "latest state" fields (current MMR, username) only update from a newer match, so a late redelivery can't overwrite fresh data. An integration test caught exactly this last-writer-wins bug before the fix.
+
+```
+GET /leaderboard?top=10        top players by MMR with wins, losses, win rate, streaks
+GET /stats/players/{id}        one player's stats
+GET /stats/daily?days=7        matches created / completed per day
+```
 
 ## Matchmaking: Expanding MMR Window
 
@@ -105,8 +128,6 @@ Auth uses **access + refresh tokens** with rotation; only SHA-256 hashes of refr
 - **In match:** the lobby stays open for **30 s**. The opponent sees `OpponentDisconnected`; on return (new connection id, same JWT identity) the player rejoins via `JoinLobby`, receives the current match state, and the opponent sees `OpponentReconnected`. If the grace period expires, the `LobbyReaper` awards a **win by forfeit** to the connected player — with full Elo/MMR consequences.
 - **Self-cleaning state** — lobby keys carry a 10-minute TTL as a last-resort backstop.
 
-Planned for v1.1 completion: k6 load-test numbers, GitHub Actions + Testcontainers integration tests.
-
 ## Tests
 
 ```bash
@@ -114,13 +135,17 @@ dotnet test   # requires Docker (integration tests use Testcontainers)
 ```
 
 - **Unit tests** — Elo calculator (K-factor behavior, underdog gains, zero-sum property), expanding match window, rock-paper-scissors resolution. Pure domain logic, no dependencies.
-- **Integration tests (Testcontainers)** — real PostgreSQL and Redis containers, no mocks:
-  - Full end-to-end flow: two SignalR clients queue up, get matched by the real `MatchmakerService`, play a best-of-3 match, and both players' MMR (+20/−20) and match history are asserted from the database.
+- **Integration tests (Testcontainers)** — real PostgreSQL, Redis and RabbitMQ containers, no mocks:
+  - Full end-to-end flow: two SignalR clients queue up, get matched by the real `MatchmakerService`, play a best-of-3 match, and both players' MMR (+20/−20) and match history are asserted from the database. The `MatchCreated` and `MatchCompleted` events are then received from RabbitMQ through the outbox, with the expected winner and MMR deltas.
   - Race condition: 10 parallel queue-join requests from the same player → exactly 1 accepted, 9 rejected (`ZADD NX` atomicity).
   - Refresh token rotation: a used refresh token is rejected on reuse.
   - Server-side move validation: invalid moves and double moves are rejected.
+- **Stats service tests** (`tests/Matchmaking.Stats.Tests`):
+  - Streak and "latest MMR" rules as pure unit tests.
+  - Consumers through the MassTransit in-memory test harness (no Docker needed).
+  - End-to-end with real RabbitMQ + PostgreSQL: published matches appear on `/leaderboard`, and a duplicated message (same `MessageId`) is counted once.
 
-CI (GitHub Actions) runs build + all tests + Docker image build on every push.
+CI (GitHub Actions) runs build + all tests + Docker image builds (API and Stats) on every push.
 
 ## Load Testing (k6)
 
@@ -162,13 +187,17 @@ src/Matchmaking.Api/
   Queue/          Redis queue service, controller, matchmaker BackgroundService
   Lobby/          Redis lobby store, SignalR GameHub, match finalizer, lobby reaper
   wwwroot/        minimal demo client
+src/Matchmaking.Contracts/   event contracts shared by publisher and consumers
+src/Matchmaking.Stats/       RabbitMQ consumers + leaderboard API (own database)
 tests/Matchmaking.Tests/
+tests/Matchmaking.Stats.Tests/
 nginx.conf        WebSocket-aware reverse proxy for the 2 API replicas
 ```
 
 ## Roadmap
 
 - **v1.1** — ✅ complete: Redis distributed locks, reconnect flow, 2 replicas + nginx + SignalR backplane, GitHub Actions + Testcontainers, k6 load tests.
-- **v2** — 2v2 party queue with team balancing, OpenTelemetry + Prometheus + Grafana, seasonal leaderboard, MMR decay.
+- **v1.2** — ✅ complete: RabbitMQ + MassTransit, transactional outbox, idempotent Stats service with leaderboard, retries and dead-letter queues.
+- **v2** — 2v2 party queue with team balancing, OpenTelemetry + Prometheus + Grafana, seasonal leaderboard (built on the Stats service), MMR decay.
 
 See [PLAN.md](PLAN.md) for the full design document.

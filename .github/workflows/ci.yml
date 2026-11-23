@@ -36,3 +36,6 @@ jobs:
 
       - name: Build Docker image
         run: docker build -f src/Matchmaking.Api/Dockerfile -t matchforge-api .
+        
+      - name: Build Stats image
+        run: docker build -f src/Matchmaking.Stats/Dockerfile -t matchforge-stats .

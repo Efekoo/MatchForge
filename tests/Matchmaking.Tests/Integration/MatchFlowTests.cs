@@ -9,7 +9,8 @@ namespace Matchmaking.Tests.Integration;
 
 /// <summary>
 /// Uçtan uca akış: kuyruk → eşleşme (gerçek MatchmakerService) → lobi →
-/// taş-kağıt-makas (best of 3) → sonuç Postgres'e yazılır → Elo güncellenir.
+/// taş-kağıt-makas (best of 3) → sonuç Postgres'e yazılır → Elo güncellenir →
+/// olaylar outbox üzerinden RabbitMQ'ya yayınlanır.
 /// Mock yok; iki gerçek SignalR istemcisi maçı gerçekten oynar.
 /// </summary>
 [Collection("api")]
@@ -69,6 +70,20 @@ public class MatchFlowTests(ApiFactory factory)
         // MMR geçmişi de yazılmış olmalı (denetlenebilirlik)
         var history = await httpA.GetFromJsonAsync<List<HistoryEntry>>("/players/me/history", cts.Token);
         Assert.Single(history!);
+
+        // Olaylar: outbox → RabbitMQ → dinleyici. Diğer servislerin gördüğü veri bu.
+        var created = await EventRecorder.WaitForAsync(factory.Events.Created,
+            e => e.PlayerAId == authA.PlayerId || e.PlayerBId == authA.PlayerId, cts.Token);
+        Assert.Equal(lobbyA, created.LobbyId.ToString("N"));
+
+        var completed = await EventRecorder.WaitForAsync(factory.Events.Completed,
+            e => e.WinnerId == authA.PlayerId, cts.Token);
+        Assert.Equal(authB.PlayerId, completed.LoserId);
+        Assert.Equal(1020, completed.WinnerNewMmr);
+        Assert.Equal(980, completed.LoserNewMmr);
+        Assert.Equal(20, completed.WinnerDelta);
+        Assert.Equal(-20, completed.LoserDelta);
+        Assert.False(completed.Forfeit);
     }
 
     private record HistoryEntry(Guid MatchId, int OldMmr, int NewMmr, DateTime CreatedAt);

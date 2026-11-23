@@ -81,7 +81,7 @@ public class LobbyReaperService(
                     // Hükmen mağlubiyet: bağlı kalan oyuncu kazanır
                     var aWon = bGone;
                     await lobbies.SetFieldsAsync(lobbyId, ("state", "Finished"));
-                    var result = await finalizer.FinalizeAsync(lobby, aWon);
+                    var result = await finalizer.FinalizeAsync(lobby, aWon, forfeit: true);
 
                     logger.LogInformation("Lobby {Lobby}: {Loser} forfeited (disconnect > {Grace}s)",
                         lobbyId, aWon ? lobby.NameB : lobby.NameA, GameHub.LobbyGrace.TotalSeconds);

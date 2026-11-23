@@ -2,6 +2,8 @@ using Matchmaking.Api.Data;
 using Matchmaking.Api.Domain;
 using Matchmaking.Api.Infrastructure;
 using Matchmaking.Api.Lobby;
+using Matchmaking.Contracts;
+using MassTransit;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using StackExchange.Redis;
@@ -184,6 +186,15 @@ public class MatchmakerService(
 
         var lobbyId = await lobbies.CreateAsync(pa.Id, pa.Username, pa.Mmr,
                                                 pb.Id, pb.Username, pb.Mmr);
+
+        // Olay outbox üzerinden gider: RabbitMQ o an erişilemese bile kaybolmaz
+        var publisher = scope.ServiceProvider.GetRequiredService<IPublishEndpoint>();
+        await publisher.Publish(new MatchCreated(
+            Guid.Parse(lobbyId),
+            pa.Id, pa.Username, pa.Mmr,
+            pb.Id, pb.Username, pb.Mmr,
+            DateTime.UtcNow), ct);
+        await appDb.SaveChangesAsync(ct);
 
         logger.LogInformation("Match: {A} ({MmrA}) vs {B} ({MmrB}) -> lobby {Lobby}",
             pa.Username, pa.Mmr, pb.Username, pb.Mmr, lobbyId);

@@ -4,6 +4,7 @@ using Matchmaking.Api.Data;
 using Matchmaking.Api.Infrastructure;
 using Matchmaking.Api.Lobby;
 using Matchmaking.Api.Queue;
+using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using StackExchange.Redis;
@@ -16,6 +17,8 @@ JwtSecurityTokenHandler.DefaultInboundClaimTypeMap.Clear();
 var pgConn = builder.Configuration.GetConnectionString("Postgres")
     ?? "Host=localhost;Port=5432;Database=matchmaking;Username=postgres;Password=postgres";
 var redisConn = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
+var rabbitConn = builder.Configuration.GetConnectionString("RabbitMq")
+    ?? "amqp://guest:guest@localhost:5672";
 var jwtKey = builder.Configuration["Jwt:Key"]
     ?? "dev-only-change-me-in-prod-0123456789abcdef0123456789abcdef";
 builder.Configuration["Jwt:Key"] = jwtKey;
@@ -31,6 +34,26 @@ builder.Services.AddSingleton<MatchFinalizer>();
 builder.Services.AddSingleton<RedisLockService>();
 builder.Services.AddHostedService<MatchmakerService>();
 builder.Services.AddHostedService<LobbyReaperService>();
+
+// --- Mesajlaşma (RabbitMQ + transactional outbox) ---
+// Api sadece olay yayınlar; tüketici yok. Olaylar önce Postgres'teki outbox tablosuna
+// yazılır, delivery servisi onları sırayla RabbitMQ'ya iletir (at-least-once).
+builder.Services.AddMassTransit(x =>
+{
+    x.AddEntityFrameworkOutbox<AppDbContext>(o =>
+    {
+        o.UsePostgres();
+        o.UseBusOutbox();
+        o.QueryDelay = TimeSpan.FromSeconds(1);
+        o.DuplicateDetectionWindow = TimeSpan.FromMinutes(30);
+    });
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(new Uri(rabbitConn));
+        cfg.ConfigureEndpoints(context);
+    });
+});
 
 builder.Services.AddControllers();
 
@@ -63,6 +86,15 @@ builder.Services
         };
     });
 builder.Services.AddAuthorization();
+
+// Host, bus RabbitMQ'ya bağlanıp kuyruk/exchange bağlarını kurmadan "hazır" sayılmasın:
+// aksi halde ilk açılışta, kuyruk henüz bağlanmamışken yayınlanan olaylar kaybolabilir.
+builder.Services.Configure<MassTransitHostOptions>(o =>
+{
+    o.WaitUntilStarted = true;
+    o.StartTimeout = TimeSpan.FromSeconds(30);
+    o.StopTimeout = TimeSpan.FromSeconds(30);
+});
 
 var app = builder.Build();
 

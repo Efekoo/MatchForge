@@ -1,4 +1,5 @@
 using Matchmaking.Api.Domain;
+using MassTransit;
 using Microsoft.EntityFrameworkCore;
 
 namespace Matchmaking.Api.Data;
@@ -40,5 +41,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(t => t.TokenHash);
             e.HasIndex(t => t.PlayerId);
         });
+
+        // Transactional outbox tabloları (MassTransit): yayınlanacak olaylar maç sonucuyla
+        // aynı transaction'da yazılır, arka plandaki delivery servisi RabbitMQ'ya iletir.
+        // Böylece "DB'ye yazıldı ama mesaj gitmedi" (ya da tersi) durumu oluşmaz.
+        mb.AddInboxStateEntity();
+        mb.AddOutboxMessageEntity();
+        mb.AddOutboxStateEntity();
     }
 }

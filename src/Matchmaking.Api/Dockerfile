@@ -1,6 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 COPY src/Matchmaking.Api/Matchmaking.Api.csproj src/Matchmaking.Api/
+COPY src/Matchmaking.Contracts/Matchmaking.Contracts.csproj src/Matchmaking.Contracts/
 RUN dotnet restore src/Matchmaking.Api/Matchmaking.Api.csproj
 COPY src/ src/
 RUN dotnet publish src/Matchmaking.Api/Matchmaking.Api.csproj -c Release -o /app
